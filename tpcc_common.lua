@@ -799,9 +799,9 @@ function wait_for_all_threads_to_complete_phase(drv, con, phase)
             phase
         )
 
-        local rs = con:query(query)
-        if rs and rs.rows and rs.rows[1] then
-            completed_threads = tonumber(rs.rows[1][1]) or 0
+        local row = con:query_row(query)
+        if row then
+            completed_threads = tonumber(row[1]) or 0
         end
 
         if completed_threads < expected_threads then
