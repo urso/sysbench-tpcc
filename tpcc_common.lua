@@ -97,30 +97,63 @@ end
 function cmd_prepare()
     local drv, con = db_connection_init()
 
-    -- create tables in parallel table per thread
+    -- Setup coordination table for thread synchronization
+    create_coordination_table(drv, con)
+
+    -- Phase 1: Table Creation
+    -- Each thread creates all tables (using CREATE TABLE IF NOT EXISTS)
+    create_tables(drv, con, 1) -- table_num parameter is no longer used
+
+    -- Phase 2: Items Loading
+    -- Load items data in parallel - each thread handles a subset
     for i = sysbench.tid % sysbench.opt.threads + 1, sysbench.opt.tables,
     sysbench.opt.threads do
-        create_tables(drv, con, i)
+        load_items(drv, con, i)
     end
 
-    -- make sure all tables are created before we load data
+    -- Phase 3: Index Creation (if index_after=0)
+    if sysbench.opt.index_after == 0 then
+        -- Signal that this thread has completed items loading
+        signal_phase_complete(drv, con, "items_loading")
 
-    print("Waiting on tables 30 sec\n")
-    sleep(30)
+        -- Wait for all threads to complete items loading before creating indexes
+        if sysbench.opt.threads > 1 then
+            wait_for_all_threads_to_complete_phase(drv, con, "items_loading")
+        end
 
-    for i = sysbench.tid % sysbench.opt.threads + 1, sysbench.opt.scale,
-    sysbench.opt.threads do
-        load_tables(drv, con, i)
-    end
-
-    if sysbench.opt.index_after == 1 then
-        print("Waiting before creating indexes 30 sec\n")
-        sleep(30)
+        -- Create indexes in parallel - each thread handles a subset
         for i = sysbench.tid % sysbench.opt.threads + 1, sysbench.opt.tables,
         sysbench.opt.threads do
             create_indexes(drv, con, i)
         end
     end
+
+    -- Phase 4: Warehouse Data Loading
+    -- Load warehouse data in parallel - each thread handles a subset
+    for i = sysbench.tid % sysbench.opt.threads + 1, sysbench.opt.scale,
+    sysbench.opt.threads do
+        load_tables(drv, con, i)
+    end
+
+    -- Phase 5: Index Creation (if index_after=1)
+    if sysbench.opt.index_after == 1 then
+        -- Signal that this thread has completed data loading
+        signal_phase_complete(drv, con, "data_loading")
+
+        -- Wait for all threads to complete data loading before creating indexes
+        if sysbench.opt.threads > 1 then
+            wait_for_all_threads_to_complete_phase(drv, con, "data_loading")
+        end
+
+        -- Create indexes in parallel - each thread handles a subset
+        for i = sysbench.tid % sysbench.opt.threads + 1, sysbench.opt.tables,
+        sysbench.opt.threads do
+            create_indexes(drv, con, i)
+        end
+    end
+
+    -- Cleanup coordination table
+    cleanup_coordination_table(drv, con)
 end
 
 -- Check consistency
@@ -141,7 +174,7 @@ sysbench.cmdline.commands = {
 }
 
 
-function create_tables(drv, con, table_num)
+function create_tables(drv, con, unused_table_num)
     local id_index_def, id_def
     local engine_def = ""
     local extra_table_options = ""
@@ -158,9 +191,11 @@ function create_tables(drv, con, table_num)
         datetime_type = "datetime"
     end
 
-    print(string.format("Creating tables: %d\n", table_num))
+    print(string.format("Creating all tables from thread: %d\n", sysbench.tid))
 
-    query = string.format([[
+    -- Create all tables, not just table_num
+    for i = 1, sysbench.opt.tables do
+        query = string.format([[
 	CREATE TABLE IF NOT EXISTS warehouse%d (
 	w_id smallint not null,
 	w_name varchar(10),
@@ -173,11 +208,11 @@ function create_tables(drv, con, table_num)
 	w_ytd decimal(12,2),
 	primary key (w_id)
 	) %s %s]],
-        table_num, engine_def, extra_table_options)
+            i, engine_def, extra_table_options)
 
-    con:query(query)
+        con:query(query)
 
-    query = string.format([[
+        query = string.format([[
 	create table IF NOT EXISTS district%d (
 	d_id ]] .. tinyint_type .. [[ not null,
 	d_w_id smallint not null,
@@ -192,13 +227,13 @@ function create_tables(drv, con, table_num)
 	d_next_o_id int,
 	primary key (d_w_id, d_id)
 	) %s %s]],
-        table_num, engine_def, extra_table_options)
+            i, engine_def, extra_table_options)
 
-    con:query(query)
+        con:query(query)
 
-    -- CUSTOMER TABLE
+        -- CUSTOMER TABLE
 
-    query = string.format([[
+        query = string.format([[
 	create table IF NOT EXISTS customer%d (
 	c_id int not null,
 	c_d_id ]] .. tinyint_type .. [[ not null,
@@ -223,18 +258,18 @@ function create_tables(drv, con, table_num)
 	c_data text,
 	PRIMARY KEY(c_w_id, c_d_id, c_id)
 	) %s %s]],
-        table_num, engine_def, extra_table_options)
+            i, engine_def, extra_table_options)
 
-    con:query(query)
+        con:query(query)
 
-    -- HISTORY TABLE
-    local hist_auto_inc = ""
-    local hist_pk = ""
-    if sysbench.opt.force_pk == 1 then
-        hist_auto_inc = "id int NOT NULL AUTO_INCREMENT,"
-        hist_pk = ",PRIMARY KEY(id)"
-    end
-    query = string.format([[
+        -- HISTORY TABLE
+        local hist_auto_inc = ""
+        local hist_pk = ""
+        if sysbench.opt.force_pk == 1 then
+            hist_auto_inc = "id int NOT NULL AUTO_INCREMENT,"
+            hist_pk = ",PRIMARY KEY(id)"
+        end
+        query = string.format([[
 	create table IF NOT EXISTS history%d (
         %s
 	h_c_id int,
@@ -246,11 +281,11 @@ function create_tables(drv, con, table_num)
 	h_amount decimal(6,2),
 	h_data varchar(24) %s
 	) %s %s]],
-        table_num, hist_auto_inc, hist_pk, engine_def, extra_table_options)
+            i, hist_auto_inc, hist_pk, engine_def, extra_table_options)
 
-    con:query(query)
+        con:query(query)
 
-    query = string.format([[
+        query = string.format([[
 	create table IF NOT EXISTS orders%d (
 	o_id int not null,
 	o_d_id ]] .. tinyint_type .. [[ not null,
@@ -262,24 +297,24 @@ function create_tables(drv, con, table_num)
 	o_all_local ]] .. tinyint_type .. [[,
 	PRIMARY KEY(o_w_id, o_d_id, o_id)
 	) %s %s]],
-        table_num, engine_def, extra_table_options)
+            i, engine_def, extra_table_options)
 
-    con:query(query)
+        con:query(query)
 
-    -- NEW_ORDER table
+        -- NEW_ORDER table
 
-    query = string.format([[
+        query = string.format([[
 	create table IF NOT EXISTS new_orders%d (
 	no_o_id int not null,
 	no_d_id ]] .. tinyint_type .. [[ not null,
 	no_w_id smallint not null,
 	PRIMARY KEY(no_w_id, no_d_id, no_o_id)
 	) %s %s]],
-        table_num, engine_def, extra_table_options)
+            i, engine_def, extra_table_options)
 
-    con:query(query)
+        con:query(query)
 
-    query = string.format([[
+        query = string.format([[
 	create table IF NOT EXISTS order_line%d (
 	ol_o_id int not null,
 	ol_d_id ]] .. tinyint_type .. [[ not null,
@@ -293,13 +328,13 @@ function create_tables(drv, con, table_num)
 	ol_dist_info char(24),
 	PRIMARY KEY(ol_w_id, ol_d_id, ol_o_id, ol_number)
 	) %s %s]],
-        table_num, engine_def, extra_table_options)
+            i, engine_def, extra_table_options)
 
-    con:query(query)
+        con:query(query)
 
-    -- STOCK table
+        -- STOCK table
 
-    query = string.format([[
+        query = string.format([[
 	create table IF NOT EXISTS stock%d (
 	s_i_id int not null,
 	s_w_id smallint not null,
@@ -320,13 +355,11 @@ function create_tables(drv, con, table_num)
 	s_data varchar(50),
 	PRIMARY KEY(s_w_id, s_i_id)
 	) %s %s]],
-        table_num, engine_def, extra_table_options)
+            i, engine_def, extra_table_options)
 
-    con:query(query)
+        con:query(query)
 
-    local i = table_num
-
-    query = string.format([[
+        query = string.format([[
 	create table IF NOT EXISTS item%d (
 	i_id int not null,
 	i_im_id int,
@@ -335,11 +368,18 @@ function create_tables(drv, con, table_num)
 	i_data varchar(50),
 	PRIMARY KEY(i_id)
 	) %s %s]],
-        i, engine_def, extra_table_options)
+            i, engine_def, extra_table_options)
 
-    con:query(query)
+        con:query(query)
+    end
+end
 
-    con:bulk_insert_init("INSERT INTO item" .. i .. " (i_id, i_im_id, i_name, i_price, i_data) values")
+function load_items(drv, con, table_num)
+    local query
+
+    print(string.format("Loading items for table: %d\n", table_num))
+
+    con:bulk_insert_init("INSERT INTO item" .. table_num .. " (i_id, i_im_id, i_name, i_price, i_data) values")
     for j = 1, MAXITEMS do
         local i_im_id = sysbench.rand.uniform(1, 10000)
         local i_price = sysbench.rand.uniform_double() * 100 + 1
@@ -352,10 +392,6 @@ function create_tables(drv, con, table_num)
         con:bulk_insert_next(query)
     end
     con:bulk_insert_done()
-
-    if sysbench.opt.index_after == 0 then
-        create_indexes(drv, con, table_num)
-    end
 end
 
 function set_isolation_level(drv, con)
@@ -595,6 +631,9 @@ function cleanup()
         con:query("DROP TABLE IF EXISTS item" .. i)
         con:query("DROP TABLE IF EXISTS warehouse" .. i)
     end
+
+    -- Clean up coordination table if it exists
+    cleanup_coordination_table(drv, con)
 end
 
 function Lastname(num)
@@ -687,6 +726,105 @@ function create_indexes(drv, con, table_num)
         con:query("ALTER TABLE stock" ..
             i .. " ADD CONSTRAINT fkey_stock_2_" .. table_num .. " FOREIGN KEY(s_i_id) REFERENCES item" .. i .. "(i_id)")
     end
+end
+
+function create_coordination_table(drv, con)
+    local query
+    if drv:name() == "mysql" or drv:name() == "attachsql" or drv:name() == "drizzle" then
+        query = [[
+            CREATE TABLE IF NOT EXISTS sysbench_coordination (
+                thread_id int PRIMARY KEY,
+                phase varchar(50),
+                completed_at timestamp DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB
+        ]]
+    elseif drv:name() == "pgsql" then
+        query = [[
+            CREATE TABLE IF NOT EXISTS sysbench_coordination (
+                thread_id int PRIMARY KEY,
+                phase varchar(50),
+                completed_at timestamp DEFAULT CURRENT_TIMESTAMP
+            )
+        ]]
+    else
+        query = [[
+            CREATE TABLE IF NOT EXISTS sysbench_coordination (
+                thread_id int PRIMARY KEY,
+                phase varchar(50),
+                completed_at timestamp DEFAULT CURRENT_TIMESTAMP
+            )
+        ]]
+    end
+
+    con:query(query)
+end
+
+function signal_phase_complete(drv, con, phase)
+    local query
+    if drv:name() == "mysql" or drv:name() == "attachsql" or drv:name() == "drizzle" then
+        query = string.format(
+            "INSERT INTO sysbench_coordination (thread_id, phase) VALUES (%d, '%s') " ..
+            "ON DUPLICATE KEY UPDATE phase='%s', completed_at=CURRENT_TIMESTAMP",
+            sysbench.tid, phase, phase
+        )
+    elseif drv:name() == "pgsql" then
+        query = string.format(
+            "INSERT INTO sysbench_coordination (thread_id, phase) VALUES (%d, '%s') " ..
+            "ON CONFLICT (thread_id) DO UPDATE SET phase='%s', completed_at=CURRENT_TIMESTAMP",
+            sysbench.tid, phase, phase
+        )
+    else
+        -- Fallback for other databases - use INSERT OR REPLACE
+        query = string.format(
+            "INSERT OR REPLACE INTO sysbench_coordination (thread_id, phase) VALUES (%d, '%s')",
+            sysbench.tid, phase
+        )
+    end
+
+    con:query(query)
+end
+
+function wait_for_all_threads_to_complete_phase(drv, con, phase)
+    local expected_threads = sysbench.opt.threads
+    local completed_threads = 0
+    local max_wait_seconds = 3600 -- 1 hour maximum wait
+    local wait_count = 0
+
+    print(string.format("Thread %d waiting for all %d threads to complete phase '%s'...\n",
+        sysbench.tid, expected_threads, phase))
+
+    while completed_threads < expected_threads and wait_count < max_wait_seconds do
+        local query = string.format(
+            "SELECT COUNT(*) FROM sysbench_coordination WHERE phase = '%s'",
+            phase
+        )
+
+        local rs = con:query(query)
+        if rs and rs.rows and rs.rows[1] then
+            completed_threads = tonumber(rs.rows[1][1]) or 0
+        end
+
+        if completed_threads < expected_threads then
+            sleep(1)                     -- Wait 1 second before checking again
+            wait_count = wait_count + 1
+            if wait_count % 10 == 0 then -- Progress update every 10 seconds
+                print(string.format("Thread %d: %d/%d threads completed phase '%s', waited %ds\n",
+                    sysbench.tid, completed_threads, expected_threads, phase, wait_count))
+            end
+        end
+    end
+
+    if wait_count >= max_wait_seconds then
+        error(string.format("Timeout waiting for threads to complete phase '%s' after %d seconds",
+            phase, max_wait_seconds))
+    end
+
+    print(string.format("Thread %d: All threads completed phase '%s' after %ds\n",
+        sysbench.tid, phase, wait_count))
+end
+
+function cleanup_coordination_table(drv, con)
+    con:query("DROP TABLE IF EXISTS sysbench_coordination")
 end
 
 -- vim:ts=4 ss=4 sw=4 expandtab
